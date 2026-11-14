@@ -19,7 +19,10 @@ docker compose up --build
 - API 进程 1: <http://localhost:8001/docs> （Swagger UI）
 - API 进程 2: <http://localhost:8002/docs>
 - 两个进程共享 `corpus-data` 卷里的同一个 SQLite 文件
-- `seeder` 一次性容器会在两个 API 健康后自动载入演示语料（含桥接文章），随后退出
+- `seeder` 一次性容器在两个 API 健康后调用 `POST /articles/seed` **自动灌入演示语料，随后退出**。
+  灌入只在**首次空库**（代次 0 且无任何文章）时真正写入；之后无论重启、重建镜像，
+  还是文章被人工删空，都不会再改写已提交语料。需要显式重置时手动运行
+  `python3 scripts/demo.py seed --base http://localhost:8001`
 
 ### 本地（无 Docker）
 
@@ -42,7 +45,10 @@ scripts/local_dev.sh stop
 | `train-clean-1` / `test-clean-1` | train / test | 干净对照 |
 
 ```bash
-# 1) 载入演示语料并查看两个跨集合污染组
+# 0) 自动灌入（compose 的 seeder 跑的就是它）：仅首次空库写入，否则跳过且不改任何状态
+python3 scripts/demo.py auto-seed --base http://localhost:8001
+
+# 1) 显式重置：无论当前语料如何，整批替换为演示语料（会删除其它文章，慎用）
 python3 scripts/demo.py seed --base http://localhost:8001
 
 # 2) 桥接文章：删除 test-bridge -> 污染组拆开；补回 -> 组重新形成
@@ -65,6 +71,7 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
 | 方法/路径 | 说明 |
 |---|---|
 | `POST /articles/batch` | 整批补录/更正/删除：`{"upserts": [{id, side, text}], "deletes": [id]}`。**单事务原子生效**，任一失败整批回滚 |
+| `POST /articles/seed` | 自动灌入入口：`{"upserts": [...]}`，**仅首次空库**（代次 0 且无文章）才写入；否则跳过（`applied=false`），不改代次、不触发重算。判定与写入同一事务，并发按提交顺序裁决 |
 | `GET /articles` | 当前已提交语料列表 |
 | `GET /contamination` | 核查结论。`200`：跨集合污染组、成员、直接相似边；`202`：待核查（附 current/published 代次） |
 | `GET /status` | 实例、代次、语料计数、后台作业状态 |
@@ -124,6 +131,13 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
   消失后原组自然拆分（见演示 2）。
 - **整批原子性**：格式校验（pydantic）→ 单事务应用 + 300 篇上限检查，
   任一失败整体回滚。
+- **自动灌入不改写已提交语料**：`POST /articles/seed` 把"首次空库"判定
+  （`current_generation == 0` 且语料为空）与写入放在**同一个 `BEGIN
+  IMMEDIATE` 事务**里，并发时由提交顺序裁决——人工批改先提交（代次已 > 0，
+  哪怕把文章删空）则灌入跳过；灌入先提交则随后的人工批改照常生效；N 个
+  并发灌入只有一个拿到写锁先提交，其余全部跳过。跳过纯粹是只读事务：
+  不动代次、不入队重算作业；写入则与人工批次一样走待核查/发布规则。
+  该入口只接受 upsert，结构上不可能删除已提交文章。
 - **重启自动补完**：启动时若 `current_generation > published_generation`
   自动补建待比对作业；作业租约机制保证崩溃进程未完成的任务被接管。
 
@@ -140,8 +154,9 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
 ## 验证
 
 ```bash
-python3 tests/e2e_check.py     # 34 项需求检查：校验、原子性、300 上限、202 门控、
-                               # 桥接拆组、并发提交、旧算丢弃、崩溃重启恢复、不混版
+python3 tests/e2e_check.py     # 54 项需求检查：自动灌入门控与并发裁决、校验、原子性、
+                               # 300 上限、202 门控、桥接拆组、并发提交、旧算丢弃、
+                               # 崩溃重启恢复、不混版
 ```
 
 ## 结构
@@ -154,7 +169,7 @@ app/
   worker.py      后台比对 worker（租约认领、快照、原子发布）
   schemas.py     请求模型（5–2000 字符等校验）
 scripts/
-  demo.py        演示数据（含桥接文章）+ 四个场景
+  demo.py        演示数据（含桥接文章）+ 场景（auto-seed 自动灌入 / seed 显式重置 / bridge / concurrent / restart）
   local_dev.sh   无 Docker 的双进程本地运行器
 tests/
   e2e_check.py   端到端需求验证（自起两个进程共库）

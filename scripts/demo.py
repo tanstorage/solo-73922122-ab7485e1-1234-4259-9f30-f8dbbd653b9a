@@ -3,8 +3,13 @@
 
 Scenarios
 ---------
-seed        load the demo corpus (direct near-duplicate pair, a *bridge*
-            article connecting a train and a test article, clean articles)
+seed        explicit manual reset: atomically replace the committed corpus
+            with the demo seed articles (deletes anything else — use with
+            care; this is the maintenance/reset entry point)
+auto-seed   what the compose `seeder` service runs: load the demo corpus
+            only into a fresh, never-modified database; when the database
+            already holds a committed corpus (even a manually emptied one)
+            the API skips the load and nothing is rewritten
 bridge      delete the bridge article -> its contamination group splits;
             re-add it -> the group forms again
 concurrent  submit batches while a background comparison is running:
@@ -222,7 +227,7 @@ def reset_to_seed(base):
 
 
 def scenario_seed(base):
-    print("== seed: loading demo corpus ==")
+    print("== seed: explicit reset to the demo corpus ==")
     reset_to_seed(base)
     code, report = get_contamination(base)
     expect(code == 200, "verification covers the seeded corpus")
@@ -230,6 +235,36 @@ def scenario_seed(base):
     show_groups(report)
     expect(report["contamination_group_count"] == 2, "two contamination groups found")
     print("seed done.\n")
+
+
+def scenario_auto_seed(base):
+    """What the compose `seeder` service runs on every `docker compose up`.
+
+    Loads the demo corpus only into a fresh, never-modified database. When
+    the database already holds a committed corpus — even one that was
+    manually emptied — the API skips the load, and this scenario leaves
+    everything untouched (exit 0, so the one-shot container stays green).
+    """
+    print("== auto-seed: load demo corpus only into a fresh database ==")
+    seed = build_demo_articles()
+    verify_demo_articles(seed)
+    code, body = http(base, "POST", "/articles/seed", {"upserts": seed})
+    expect(code == 200, f"auto-seed request answered 200 (got {code})")
+    if not body["applied"]:
+        print(
+            f"  skipped: {body['reason']} — committed corpus left untouched "
+            f"(generation {body['generation']}, {body['articles']} articles)"
+        )
+        print("auto-seed done (nothing to do).\n")
+        return
+    print(f"  applied: demo corpus committed as generation {body['generation']}")
+    wait_ready(base)
+    code, report = get_contamination(base)
+    expect(code == 200, "verification covers the auto-seeded corpus")
+    print("  contamination groups after auto-seed:")
+    show_groups(report)
+    expect(report["contamination_group_count"] == 2, "two contamination groups found")
+    print("auto-seed done.\n")
 
 
 def scenario_bridge(base):
@@ -371,7 +406,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "scenario",
-        choices=["seed", "bridge", "concurrent", "restart", "all", "wait", "status"],
+        choices=["seed", "auto-seed", "bridge", "concurrent", "restart", "all", "wait", "status"],
     )
     parser.add_argument("--base", default=DEFAULT_BASE, help="API base URL")
     parser.add_argument(
@@ -390,6 +425,8 @@ def main():
         print(json.dumps(body, indent=2))
     elif args.scenario == "seed":
         scenario_seed(base)
+    elif args.scenario == "auto-seed":
+        scenario_auto_seed(base)
     elif args.scenario == "bridge":
         scenario_bridge(base)
     elif args.scenario == "concurrent":

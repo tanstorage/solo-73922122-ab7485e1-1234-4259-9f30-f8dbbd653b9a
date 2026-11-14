@@ -35,3 +35,23 @@ class BatchResponse(BaseModel):
     upserted: int
     deleted: int
     articles: int
+
+
+class SeedRequest(BaseModel):
+    """Initial example corpus for the automatic first-boot loader.
+
+    Upsert-only on purpose: the auto-seed path must never be able to delete
+    committed articles. Eligibility (never-modified empty database) is
+    decided by the server inside the write transaction.
+    """
+
+    upserts: list[ArticleUpsert] = Field(min_length=1, max_length=MAX_ARTICLES)
+
+
+class SeedResponse(BaseModel):
+    applied: bool
+    reason: str
+    generation: int
+    published_generation: int
+    upserted: int
+    articles: int

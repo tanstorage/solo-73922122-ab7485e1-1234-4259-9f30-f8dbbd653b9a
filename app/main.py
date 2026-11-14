@@ -12,6 +12,16 @@ cover the whole currently committed corpus (published_generation ==
 current_generation); otherwise it answers 202 with the pending state, so
 stale groups are never paired with new texts and a "clean" verdict is
 never reported early.
+
+Auto-seed rule: POST /articles/seed loads an initial example corpus only
+into a never-modified database (generation 0 and no articles). The check
+and the write commit in one transaction, so concurrent activity is
+arbitrated by commit order: a manual batch that committed first makes the
+seed a no-op (even if it emptied the corpus), a seed that committed first
+keeps later manual changes, and of any number of concurrent seeds exactly
+one writes. A skipped seed never bumps the generation or enqueues a
+recompute; an applied seed is an ordinary committed batch and follows the
+pending/publish rules above.
 """
 
 import logging
@@ -26,7 +36,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .db import MAX_ARTICLES, connect, get_meta, init_db
-from .schemas import BatchRequest, BatchResponse
+from .schemas import BatchRequest, BatchResponse, SeedRequest, SeedResponse
 from .worker import CompareWorker
 
 logging.basicConfig(
@@ -191,6 +201,88 @@ def apply_batch(req: BatchRequest):
         raise
     except sqlite3.IntegrityError as exc:
         raise HTTPException(422, f"batch rejected, nothing applied: {exc}")
+    finally:
+        conn.close()
+
+
+@app.post("/articles/seed", response_model=SeedResponse)
+def seed_corpus(req: SeedRequest):
+    """Load an initial example corpus — only into a never-modified database.
+
+    Eligibility (generation 0 and zero committed articles) is checked inside
+    the same IMMEDIATE transaction that writes, so concurrent activity is
+    arbitrated by commit order:
+
+    - a manual batch that committed first makes this a no-op — even one
+      that deleted every article (an emptied corpus is not a fresh one);
+    - if this commits first, later manual batches apply on top of it;
+    - of any number of concurrent seed calls, exactly one writes.
+
+    A skipped seed changes nothing: no generation bump, no verification
+    job. An applied seed is an ordinary committed batch (generation + 1,
+    verification job enqueued), so the pending/publish rules apply as usual.
+    """
+    upsert_ids = [u.id for u in req.upserts]
+    if len(upsert_ids) != len(set(upsert_ids)):
+        raise HTTPException(422, "duplicate article ids in seed")
+
+    conn = connect(DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current, published = get_meta(conn)
+            count = conn.execute("SELECT COUNT(*) AS c FROM articles").fetchone()["c"]
+            if current != 0 or count != 0:
+                conn.rollback()
+                log.info(
+                    "seed skipped: database already initialized "
+                    "(generation=%d, articles=%d)",
+                    current,
+                    count,
+                )
+                return SeedResponse(
+                    applied=False,
+                    reason="corpus_already_initialized",
+                    generation=current,
+                    published_generation=published,
+                    upserted=0,
+                    articles=count,
+                )
+
+            new_generation = current + 1
+            for u in req.upserts:
+                conn.execute(
+                    """
+                    INSERT INTO articles (id, side, text, updated_generation)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (u.id, u.side, u.text, new_generation),
+                )
+            count = len(req.upserts)
+            conn.execute(
+                "UPDATE meta SET current_generation = ? WHERE id = 1", (new_generation,)
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO compute_jobs (generation, status)"
+                " VALUES (?, 'pending')",
+                (new_generation,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        log.info("seed committed: generation=%d articles=%d", new_generation, count)
+        return SeedResponse(
+            applied=True,
+            reason="fresh_empty_database",
+            generation=new_generation,
+            published_generation=published,
+            upserted=count,
+            articles=count,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(422, f"seed rejected, nothing applied: {exc}")
     finally:
         conn.close()
 

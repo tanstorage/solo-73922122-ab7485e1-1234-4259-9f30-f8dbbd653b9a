@@ -2,10 +2,12 @@
 """End-to-end requirement checks against two API processes sharing one DB.
 
 Spawns two uvicorn processes on the same SQLite file (like the two compose
-services), then verifies: input validation, batch atomicity, the 300-article
-limit, 202 pending gating, contamination groups/edges, bridge-article group
-splitting, modify-while-comparing (stale results discarded), cross-process
-consistency, crash/restart recovery and no stale/mixed published results.
+services), then verifies: auto-seed first-empty-database gating and
+commit-order arbitration, input validation, batch atomicity, the
+300-article limit, 202 pending gating, contamination groups/edges,
+bridge-article group splitting, modify-while-comparing (stale results
+discarded), cross-process consistency, crash/restart recovery and no
+stale/mixed published results.
 """
 
 import os
@@ -15,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -131,6 +134,92 @@ def main():
 
 def run_checks(base1, base2, s1, s2):
     seed = build_demo_articles()
+
+    # ---- auto-seed: first-empty-database only, commit-order arbitration ----
+    # The database starts fresh (generation 0), exactly like the first
+    # `docker compose up` with a new volume.
+    r = httpx.post(f"{base1}/articles/seed", json={"upserts": []})
+    check("auto-seed with empty upserts rejected (422)", r.status_code == 422)
+    r = httpx.post(f"{base1}/articles/seed",
+                   json={"upserts": [{"id": "x", "side": "train", "text": "abcd"}]})
+    check("auto-seed validates article payloads (422)", r.status_code == 422)
+    r = httpx.get(f"{base1}/articles")
+    check("rejected auto-seeds left the corpus untouched", r.json()["count"] == 0)
+
+    # Concurrent auto-seeds (both API processes): exactly one may write.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(httpx.post, f"{base}/articles/seed",
+                        json={"upserts": seed}, timeout=30)
+            for base in (base1, base1, base2, base2)
+        ]
+        responses = [f.result() for f in futures]
+    check("all concurrent auto-seed calls answered 200",
+          all(r.status_code == 200 for r in responses))
+    bodies = [r.json() for r in responses]
+    applied = [b for b in bodies if b["applied"]]
+    check("exactly one of the concurrent auto-seeds wrote",
+          len(applied) == 1, str(bodies))
+    check("the winning auto-seed committed generation 1",
+          len(applied) == 1 and applied[0]["generation"] == 1
+          and applied[0]["articles"] == len(seed))
+    skipped = [b for b in bodies if not b["applied"]]
+    check("losing auto-seeds reported a skip and wrote nothing",
+          len(skipped) == 3 and all(b["upserted"] == 0 for b in skipped))
+
+    r = httpx.get(f"{base1}/articles")
+    check("auto-seeded corpus holds exactly the demo articles",
+          {a["id"] for a in r.json()["articles"]} == {a["id"] for a in seed})
+    final = wait_ready(base1)
+    check("auto-seed follows the pending/publish rules (verified as generation 1)",
+          final["current_generation"] == 1 and final["published_generation"] == 1)
+    r = httpx.get(f"{base2}/contamination")
+    check("auto-seeded corpus yields the two demo contamination groups",
+          r.status_code == 200 and r.json()["contamination_group_count"] == 2)
+
+    # Skipping changes nothing: no generation bump, no recompute job.
+    r = httpx.post(f"{base1}/articles/seed", json={"upserts": seed})
+    body = r.json()
+    check("auto-seed skips an already-initialized corpus",
+          r.status_code == 200 and body["applied"] is False)
+    check("skip reports the committed generation without changing it",
+          body["generation"] == 1 and body["published_generation"] == 1)
+    status = httpx.get(f"{base1}/status").json()
+    check("skip did not bump the generation or enqueue recomputation",
+          status["current_generation"] == 1 and status["published_generation"] == 1
+          and status["up_to_date"] and status["jobs"] == [])
+
+    # Seed committed first -> later manual corrections apply on top and are
+    # kept; a re-run of the auto-seed (manual committed first) must skip.
+    r = httpx.post(f"{base2}/articles/batch",
+                   json={"upserts": [{"id": "manual-1", "side": "train",
+                                      "text": "manually recorded article about central banks"}],
+                         "deletes": ["test-bridge"]})
+    check("manual correction committed after the seed",
+          r.status_code == 200 and r.json()["generation"] == 2)
+    wait_ready(base1)
+    r = httpx.post(f"{base1}/articles/seed", json={"upserts": seed})
+    check("auto-seed after a manual batch is skipped", r.json()["applied"] is False)
+    ids = {a["id"] for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    check("manual changes kept: retracted article not restored, new one not lost",
+          "manual-1" in ids and "test-bridge" not in ids and "train-direct-1" in ids)
+
+    # A manually emptied corpus is still not a "first empty database".
+    r = httpx.post(f"{base1}/articles/batch", json={"deletes": sorted(ids)})
+    check("manual batch emptied the corpus",
+          r.status_code == 200 and r.json()["articles"] == 0)
+    wait_ready(base1)
+    gen_empty = httpx.get(f"{base1}/status").json()["current_generation"]
+    r = httpx.post(f"{base2}/articles/seed", json={"upserts": seed})
+    body = r.json()
+    check("auto-seed does not rewrite a manually emptied corpus",
+          body["applied"] is False and body["articles"] == 0)
+    status = httpx.get(f"{base1}/status").json()
+    check("empty-corpus skip left generation and jobs untouched",
+          status["current_generation"] == gen_empty and status["up_to_date"]
+          and status["jobs"] == [])
+    r = httpx.get(f"{base1}/articles")
+    check("corpus still empty after the skipped auto-seed", r.json()["count"] == 0)
 
     # ---- input validation -------------------------------------------------
     r = httpx.post(f"{base1}/articles/batch",

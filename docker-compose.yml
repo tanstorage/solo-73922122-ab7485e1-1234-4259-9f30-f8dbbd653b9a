@@ -42,8 +42,11 @@ services:
       retries: 12
       start_period: 5s
 
-  # One-shot demo data loader: seeds the bridge-article demo corpus once
-  # both APIs are healthy, then exits.
+  # One-shot demo data loader: loads the example corpus ONLY into a fresh,
+  # never-modified database. The API decides atomically (commit order), so
+  # re-running this container after a rebuild/restart — or after the corpus
+  # was manually edited or even emptied — skips without touching committed
+  # articles. For an explicit reset use `demo.py seed` manually.
   seeder:
     image: corpus-checker
     depends_on:
@@ -51,7 +54,7 @@ services:
         condition: service_healthy
       api2:
         condition: service_healthy
-    command: ["python", "scripts/demo.py", "seed", "--base", "http://api1:8000"]
+    command: ["python", "scripts/demo.py", "auto-seed", "--base", "http://api1:8000"]
     restart: "no"
 
 volumes:
