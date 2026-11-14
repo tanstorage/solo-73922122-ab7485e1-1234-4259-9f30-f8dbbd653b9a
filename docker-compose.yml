@@ -1,0 +1,58 @@
+# Two API processes sharing one SQLite database (WAL) on a common volume.
+# COMPARE_DELAY_MS artificially slows the background comparison so the
+# pending (202) window and the modify-while-comparing behaviour are
+# observable; set it to 0 for near-instant verification.
+
+services:
+  api1:
+    build: .
+    image: corpus-checker
+    environment:
+      DB_PATH: /data/corpus.db
+      INSTANCE_ID: api1
+      COMPARE_DELAY_MS: "3000"
+      WORKER_INTERVAL_MS: "1000"
+    volumes:
+      - corpus-data:/data
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/status', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  api2:
+    build: .
+    image: corpus-checker
+    environment:
+      DB_PATH: /data/corpus.db
+      INSTANCE_ID: api2
+      COMPARE_DELAY_MS: "3000"
+      WORKER_INTERVAL_MS: "1000"
+    volumes:
+      - corpus-data:/data
+    ports:
+      - "8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/status', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # One-shot demo data loader: seeds the bridge-article demo corpus once
+  # both APIs are healthy, then exits.
+  seeder:
+    image: corpus-checker
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    command: ["python", "scripts/demo.py", "seed", "--base", "http://api1:8000"]
+    restart: "no"
+
+volumes:
+  corpus-data:
